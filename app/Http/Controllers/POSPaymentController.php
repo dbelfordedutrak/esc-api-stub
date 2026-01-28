@@ -13,11 +13,16 @@ use Illuminate\Support\Facades\DB;
  * ============================================================================
  *
  * Handles payment uploads from POS.
+ * Supports both regular students and cash transactions (studentId starts with "C").
  *
  * ============================================================================
  */
 class POSPaymentController extends Controller
 {
+    // Cached cash student for this request
+    private ?object $cashStudentCache = null;
+    private bool $cashStudentChecked = false;
+
     /**
      * POST /pos/payments
      *
@@ -27,35 +32,48 @@ class POSPaymentController extends Controller
     {
         $request->validate([
             'payments' => 'required|array',
-            'payments.*.ajaxId' => 'required|string',
-            'payments.*.studentId' => 'required',
-            'payments.*.paymentType' => 'required|string|in:CASH,CHECK,CREDIT',
+            'payments.*.syncKey' => 'required|string|max:64',  // {lineLogId}-{sessionId}-{localId}
+            'payments.*.localId' => 'required|integer',
+            'payments.*.studentId' => 'required',  // Can be int (12345) or string ("C100")
+            'payments.*.paymentType' => 'required|string',  // cash, check (case-insensitive)
             'payments.*.amount' => 'required|numeric',
             'payments.*.lineDate' => 'required|date_format:Y-m-d',
+            'payments.*.lineLogId' => 'required|integer',
+            'payments.*.stationSessionId' => 'required|integer',
+            'payments.*.mealType' => 'nullable|string|size:1',
+            'payments.*.lineNum' => 'nullable|integer',
+            'payments.*.checkNumber' => 'nullable|string',  // For check payments
+            'payments.*.changeGiven' => 'nullable|numeric',
         ]);
 
-        // Extract line info from token abilities
-        $abilities = $request->user()->currentAccessToken()->abilities;
-        $lineNum = $this->extractAbilityValue($abilities, 'line');
-        $mealType = $this->extractAbilityValue($abilities, 'meal');
+        // Get user ID from session
+        $token = $request->bearerToken();
+        $session = \App\Models\StationSession::findByToken($token);
+        $userId = $session ? $session->fldUserId : null;
 
-        $userId = $request->user()->id;
         $results = [];
+        $hasCashError = false;
+        $cashErrorMessage = null;
 
         DB::beginTransaction();
 
         try {
             foreach ($request->payments as $pmt) {
-                // Check for duplicate by ajaxId
+                // Use line info from payment (POS knows which line)
+                $mealType = $pmt['mealType'] ?? 'L';
+                $lineNum = $pmt['lineNum'] ?? 10;
+                $stationStudentId = (string) $pmt['studentId'];
+
+                // Check for duplicate by syncKey
                 $existing = DB::table('ww_pos_payments')
-                    ->where('fldAjaxId', $pmt['ajaxId'])
+                    ->where('fldSyncKey', $pmt['syncKey'])
                     ->first();
 
                 if ($existing) {
                     // Already exists - return existing server ID
                     $results[] = [
-                        'localId' => $pmt['localId'] ?? null,
-                        'ajaxId' => $pmt['ajaxId'],
+                        'localId' => $pmt['localId'],
+                        'syncKey' => $pmt['syncKey'],
                         'serverId' => $existing->fldId,
                         'success' => true,
                         'duplicate' => true,
@@ -63,47 +81,104 @@ class POSPaymentController extends Controller
                     continue;
                 }
 
-                // Get student/family info
-                $student = DB::table('ww_student')
-                    ->select([
-                        'ww_student.fldCloudId as student_account_id',
-                        'ww_family.fldFamPermId as family_account_id',
-                        'ww_student.fldSchool as school_id',
-                    ])
-                    ->join('ww_family', 'ww_family.fldFamPermId', '=', 'ww_student.fldFamPermId')
-                    ->where('ww_student.fldCloudId', $pmt['studentId'])
-                    ->first();
+                // Check if this is a cash transaction (studentId starts with "C")
+                $isCashTransaction = str_starts_with(strtoupper($stationStudentId), 'C');
 
-                if (!$student) {
-                    $results[] = [
-                        'localId' => $pmt['localId'] ?? null,
-                        'ajaxId' => $pmt['ajaxId'],
-                        'success' => false,
-                        'error' => "Student {$pmt['studentId']} not found",
+                if ($isCashTransaction) {
+                    // Cash payment - use special cash student
+                    try {
+                        $cashStudent = $this->getCashStudent();
+                    } catch (\Exception $e) {
+                        // Cash student not configured - skip this payment but continue with others
+                        $hasCashError = true;
+                        $cashErrorMessage = $e->getMessage();
+
+                        $results[] = [
+                            'localId' => $pmt['localId'],
+                            'syncKey' => $pmt['syncKey'],
+                            'serverId' => null,
+                            'success' => false,
+                            'error' => 'CASH_STUDENT_NOT_CONFIGURED',
+                            'errorMessage' => 'Cash Student account not configured in database. Contact administrator.',
+                        ];
+                        continue;
+                    }
+
+                    // For cash payments, look up the family ID from matching transaction
+                    // (the transaction should have been synced first with the same stationStudentId)
+                    $matchingTx = DB::table('ww_pos_transactions')
+                        ->where('fldStationStudentId', $stationStudentId)
+                        ->where('fldLineDate', $pmt['lineDate'])
+                        ->where('fldLineType', $mealType)
+                        ->first();
+
+                    $familyId = $matchingTx ? $matchingTx->fldFamPermId : null;
+
+                    $student = (object) [
+                        'student_account_id' => $cashStudent->fldCloudId,
+                        'family_account_id' => $familyId,
+                        'school_id' => null,
                     ];
-                    continue;
+                } else {
+                    // Regular student - look up by cloud ID
+                    $student = DB::table('ww_student')
+                        ->select([
+                            'ww_student.fldCloudId as student_account_id',
+                            'ww_family.fldFamPermId as family_account_id',
+                            'ww_student.fldSchool as school_id',
+                        ])
+                        ->join('ww_family', 'ww_family.fldFamPermId', '=', 'ww_student.fldFamPermId')
+                        ->where('ww_student.fldCloudId', (int) $pmt['studentId'])
+                        ->first();
+
+                    if (!$student) {
+                        \Log::warning("Payment sync: Student {$pmt['studentId']} not found in database");
+                        $student = (object) [
+                            'student_account_id' => (int) $pmt['studentId'],
+                            'family_account_id' => $pmt['familyId'] ?? null,
+                            'school_id' => $pmt['schoolCode'] ?? null,
+                        ];
+                    }
+                }
+
+                // Determine if check or cash payment method
+                $paymentType = strtoupper($pmt['paymentType']);
+                $isCheck = ($paymentType === 'CHECK' || $paymentType === 'CHK') ? 1 : 0;
+
+                // Build memo in legacy format: "LL CASH" or "BL CHK 1234" (max 18 chars)
+                // First char = meal type (L/B/D), second char = line num (last digit)
+                $lineDigit = $lineNum % 10;
+                $prefix = $mealType . $lineDigit . ' ';
+                if ($isCheck) {
+                    $checkNum = $pmt['checkNumber'] ?? '';
+                    $memo = $prefix . 'CHK ' . substr($checkNum, 0, 18 - strlen($prefix) - 4);
+                } else {
+                    $memo = $prefix . 'CASH';
                 }
 
                 // Insert payment
                 $serverId = DB::table('ww_pos_payments')->insertGetId([
-                    'fldUserId' => $userId,
-                    'fldStudentId' => $student->student_account_id,
-                    'fldFamPermId' => $student->family_account_id,
+                    'fldUserId' => $pmt['userId'] ?? $userId,
+                    'fldStudentId' => (int) $student->student_account_id,
+                    'fldFamPermId' => $student->family_account_id ? (int) $student->family_account_id : null,
                     'fldSchool' => $student->school_id,
-                    'fldPaymentType' => $pmt['paymentType'],
-                    'fldAmount' => $pmt['amount'],
-                    'fldCheckNumber' => $pmt['checkNumber'] ?? null,
-                    'fldReferenceNumber' => $pmt['referenceNumber'] ?? null,
+                    'fldMealType' => $mealType,
                     'fldLineNum' => $lineNum,
                     'fldLineDate' => $pmt['lineDate'],
-                    'fldLineType' => $mealType,
-                    'fldAjaxId' => $pmt['ajaxId'],
+                    'fldAmount' => $pmt['amount'],
+                    'fldChangeGiven' => $pmt['changeGiven'] ?? 0,
+                    'fldMemo' => $memo,
+                    'fldIsCheck' => $isCheck,
+                    'fldPosId' => $lineNum,
+                    'fldSyncKey' => $pmt['syncKey'],
+                    'fldStationStudentId' => $stationStudentId,
                     'fldCreatedDate' => Carbon::now('UTC'),
+                    'fldFixed' => 1,
                 ]);
 
                 $results[] = [
-                    'localId' => $pmt['localId'] ?? null,
-                    'ajaxId' => $pmt['ajaxId'],
+                    'localId' => $pmt['localId'],
+                    'syncKey' => $pmt['syncKey'],
                     'serverId' => $serverId,
                     'success' => true,
                 ];
@@ -111,10 +186,19 @@ class POSPaymentController extends Controller
 
             DB::commit();
 
-            return response()->json([
+            $response = [
                 'success' => true,
                 'results' => $results,
-            ]);
+            ];
+
+            // Add warning if cash payments failed due to missing configuration
+            if ($hasCashError) {
+                $response['warning'] = 'CASH_STUDENT_NOT_CONFIGURED';
+                $response['warningMessage'] = $cashErrorMessage;
+                $response['cashPaymentsFailed'] = true;
+            }
+
+            return response()->json($response);
 
         } catch (\Exception $e) {
             DB::rollBack();
@@ -124,6 +208,50 @@ class POSPaymentController extends Controller
                 'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    /**
+     * Get the cash student record (fldLcsId = 999999999)
+     * This is the special "CASH STUDENT" used for anonymous cash transactions.
+     *
+     * @throws \Exception if cash student not found
+     */
+    private function getCashStudent(): object
+    {
+        // Return cached result if already checked
+        if ($this->cashStudentChecked) {
+            if (!$this->cashStudentCache) {
+                throw $this->cashStudentNotFoundException();
+            }
+            return $this->cashStudentCache;
+        }
+
+        $this->cashStudentChecked = true;
+
+        // Look up by the legacy pattern: fldLcsId = 999999999
+        $this->cashStudentCache = DB::table('ww_student')
+            ->select('fldCloudId', 'fldFamPermId', 'fldLcsId')
+            ->where('fldLcsId', 999999999)
+            ->first();
+
+        if (!$this->cashStudentCache) {
+            throw $this->cashStudentNotFoundException();
+        }
+
+        return $this->cashStudentCache;
+    }
+
+    /**
+     * Create exception for missing cash student configuration
+     */
+    private function cashStudentNotFoundException(): \Exception
+    {
+        return new \Exception(
+            'CASH_STUDENT_NOT_CONFIGURED: This database is missing the required Cash Student record. ' .
+            'Cash payments cannot be synced until a student record with fldLcsId = 999999999 is created. ' .
+            'Please contact your system administrator to configure the Cash Student account. ' .
+            'Non-cash payments will continue to sync normally.'
+        );
     }
 
     /**

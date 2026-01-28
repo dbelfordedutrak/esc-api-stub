@@ -33,14 +33,77 @@ Menu items:
 ## API Routes (`routes/api.php`)
 
 ```
-POST   /api/auth/login
-POST   /api/auth/logout
+POST   /api/pos/login
+POST   /api/pos/logout
 GET    /api/pos/lines
 POST   /api/pos/lines/{mealType}/{lineNum}/open
 POST   /api/pos/lines/{mealType}/{lineNum}/close
 GET    /api/pos/lines/{mealType}/{lineNum}/students
 GET    /api/pos/lines/{mealType}/{lineNum}/menu
 GET    /api/pos/lines/{mealType}/{lineNum}/settings
+
+# Sync Endpoints (Upload from POS)
+POST   /api/pos/transactions    - Upload transaction batch
+POST   /api/pos/payments        - Upload payment batch
+POST   /api/pos/deletions       - Upload deletion audit log
+```
+
+### POSTransactionController (`app/Http/Controllers/POSTransactionController.php`)
+Transaction sync:
+- `store()` - POST `/api/pos/transactions` - Upload transactions from POS
+
+**Request format:**
+```json
+{
+  "transactions": [
+    {
+      "ajaxId": "unique-id",
+      "localId": 123,
+      "studentId": 12345,
+      "itemId": "01",
+      "quantity": 1,
+      "price": 2.50,
+      "lineDate": "2025-01-28",
+      "mealType": "L",
+      "lineNum": 5,
+      "transactionCode": "L"
+    }
+  ]
+}
+```
+
+**Response format:**
+```json
+{
+  "success": true,
+  "results": [
+    { "localId": 123, "ajaxId": "unique-id", "serverId": 456, "success": true },
+    { "localId": 124, "ajaxId": "unique-id-2", "serverId": 457, "success": true, "duplicate": true }
+  ]
+}
+```
+
+### POSPaymentController (`app/Http/Controllers/POSPaymentController.php`)
+Payment sync:
+- `store()` - POST `/api/pos/payments` - Upload payments from POS
+
+**Request format:**
+```json
+{
+  "payments": [
+    {
+      "ajaxId": "unique-id",
+      "localId": 123,
+      "studentId": 12345,
+      "paymentType": "cash",
+      "amount": 10.00,
+      "lineDate": "2025-01-28",
+      "mealType": "L",
+      "lineNum": 5,
+      "memo": "optional note"
+    }
+  ]
+}
 ```
 
 ## Recent Changes (Jan 2025)
@@ -52,7 +115,12 @@ GET    /api/pos/lines/{mealType}/{lineNum}/settings
 
 ## Database Tables Used
 
-- `ww_pos_linelog` - Line open/close tracking
+- `ww_pos_log_lines` - Line open/close tracking (daily line log)
+- `ww_pos_stations` - Registered POS stations (by deviceId)
+- `ww_pos_station_sessions` - Active login sessions
+- `ww_pos_transactions` - Transaction records (synced from POS)
+- `ww_pos_payments` - Payment records (synced from POS)
+- `ww_pos_transactions_delete_log` - Deletion audit log
 - `ww_student` - Student roster
 - `ww_student_linedata` - Per-student line permissions (JSON in fldData)
 - `ww_menuitem_pos` - Menu item button configuration

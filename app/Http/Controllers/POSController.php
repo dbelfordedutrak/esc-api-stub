@@ -139,6 +139,7 @@ class POSController extends Controller
             'token' => $session->fldToken,
             'isLineCloser' => (bool) $user->fldLineCloser,
             'user' => [
+                'id' => $user->fldUserId,
                 'username' => $user->fldUsername,
                 'firstName' => $user->fldFirstName,
                 'lastName' => $user->fldLastName,
@@ -440,6 +441,7 @@ class POSController extends Controller
         // Daily line log/session info
         $lineLogData = [
             'id' => $lineLog->fldId,
+            'stationSessionId' => $session->fldId,  // Unique per station - for syncKey generation
             'lineDate' => $lineLog->fldLineDate->toDateString(),
             'status' => $lineLog->status,
             'syncInfo' => $syncInfo,

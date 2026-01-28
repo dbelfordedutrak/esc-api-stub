@@ -216,8 +216,8 @@ class POSStudentController extends Controller
         // Batch load allergies for all students
         $allergiesMap = $this->getAllergiesForStudents($studentIds);
 
-        // Batch load linedata for all students
-        $linedataMap = $this->getLinedataForStudents($studentIds, $mealType, $lineNum);
+        // Batch load linedata for all students (uses cloudId, not studentId/lcsId)
+        $linedataMap = $this->getLinedataForStudents($cloudIds, $mealType, $lineNum);
 
         // Batch load notes for all students (includes family-level notes)
         // Note: ww_note.fldStudentId matches ww_student.fldCloudId
@@ -353,24 +353,27 @@ class POSStudentController extends Controller
 
     /**
      * Batch load linedata for multiple students
-     * Returns map of studentId => linedata object
+     * Returns map of cloudId => linedata object
+     * Note: ww_student.fldCloudId joins to ww_student_linedata.fldStudentId
      */
-    private function getLinedataForStudents(array $studentIds, string $mealType, int $lineNum): array
+    private function getLinedataForStudents(array $cloudIds, string $mealType, int $lineNum): array
     {
-        if (empty($studentIds)) {
+        if (empty($cloudIds)) {
             return [];
         }
 
+        // ww_student_linedata.fldStudentId contains the cloudId value
         $linedata = DB::table('ww_student_linedata')
-            ->whereIn('fldStudentId', $studentIds)
+            ->whereIn('fldStudentId', $cloudIds)
             ->whereRaw('COALESCE(fldDeleted, 0) = 0')
             ->get();
 
         $map = [];
         foreach ($linedata as $ld) {
             $data = (array) $ld;
-            $sid = $data['fldStudentId'] ?? null;
-            if ($sid === null) continue;
+            // fldStudentId in linedata table = cloudId from student table
+            $cloudId = $data['fldStudentId'] ?? null;
+            if ($cloudId === null) continue;
 
             // Parse the JSON data field
             $jsonData = json_decode($data['fldData'] ?? '{}', true) ?? [];
@@ -380,7 +383,7 @@ class POSStudentController extends Controller
             $lineKey = $mealType . $lineNum;
             $lineSettings = $jsonData[$lineKey] ?? $jsonData['lines'][$lineKey] ?? $jsonData;
 
-            $map[$sid] = $lineSettings;
+            $map[$cloudId] = $lineSettings;
         }
 
         return $map;
@@ -415,8 +418,8 @@ class POSStudentController extends Controller
             }
         }
 
-        // Get linedata for this student (null if none)
-        $lineSettings = $linedataMap[$studentId] ?? null;
+        // Get linedata for this student (null if none) - keyed by cloudId
+        $lineSettings = $linedataMap[$cloudId] ?? null;
 
         // Get notes for this student (student-level + family-level)
         // Note: ww_note.fldStudentId matches ww_student.fldCloudId
