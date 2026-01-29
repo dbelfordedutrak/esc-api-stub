@@ -107,7 +107,7 @@ class POSController extends Controller
         $session = StationSession::createForUser($user, $station, $abilities);
 
         // Get user's available lines (excluding childcare) with sync info
-        $lines = $user->lines()->map(function ($line) {
+        $lines = $user->posLines()->map(function ($line) {
             $lineLog = LineLog::where('fldMealType', $line->fldMealType)
                 ->where('fldLineNum', $line->fldLineNum)
                 ->where('fldLineDate', now()->toDateString())
@@ -254,7 +254,7 @@ class POSController extends Controller
         }
 
         // Get user's available lines with sync info
-        $lines = $user->lines()->map(function ($line) {
+        $lines = $user->posLines()->map(function ($line) {
             $lineLog = LineLog::where('fldMealType', $line->fldMealType)
                 ->where('fldLineNum', $line->fldLineNum)
                 ->where('fldLineDate', now()->toDateString())
