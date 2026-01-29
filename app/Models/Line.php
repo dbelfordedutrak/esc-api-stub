@@ -2,10 +2,13 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 class Line extends Model
 {
+    use HasFactory;
+
     protected $table = 'ww_line';
 
     protected $primaryKey = 'fldId';
@@ -19,9 +22,13 @@ class Line extends Model
         'fldSchoolList',
         'fldSchoolCash',
         'fldGradeList',
+        'fldSyncModifiedDate',
+        'fldIsSynced',
     ];
 
     protected $casts = [
+        'fldIsSynced' => 'boolean',
+        'fldSyncModifiedDate' => 'datetime',
         'fldSchoolList' => 'array',
         'fldGradeList' => 'array',
     ];
