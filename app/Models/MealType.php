@@ -2,10 +2,13 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 class MealType extends Model
 {
+    use HasFactory;
+
     protected $table = 'ww_mealtype';
 
     protected $primaryKey = 'fldId';
@@ -18,12 +21,16 @@ class MealType extends Model
         'fldIsFRProgram',
         'fldIsChildcare',
         'fldDeleted',
+        'fldSyncModifiedDate',
+        'fldIsSynced',
     ];
 
     protected $casts = [
         'fldIsFRProgram' => 'boolean',
         'fldIsChildcare' => 'boolean',
         'fldDeleted' => 'boolean',
+        'fldIsSynced' => 'boolean',
+        'fldSyncModifiedDate' => 'datetime',
     ];
 
     /**
