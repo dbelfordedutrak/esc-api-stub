@@ -3,16 +3,20 @@
 namespace App\Http\Middleware;
 
 use Illuminate\Auth\Middleware\Authenticate as Middleware;
-use Illuminate\Http\Request;
 
 class Authenticate extends Middleware
 {
     /**
-     * Get the path the user should be redirected to when not authenticated.
+     * Get the path the user should be redirected to when they are not authenticated.
+     *
+     * @param \Illuminate\Http\Request $request
+     * @return string|null
      */
-    protected function redirectTo(Request $request): ?string
+    protected function redirectTo($request)
     {
-        // For API, don't redirect - let it return 401
-        return null;
+        if (!$request->expectsJson())
+        {
+            return route('login');
+        }
     }
 }
