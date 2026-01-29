@@ -118,9 +118,66 @@ class User extends Authenticatable
     }
 
     /**
-     * Get lines the user has access to (excluding childcare lines)
+     * Get childcare lines the user has access to (for ESC app)
      */
     public function lines()
+    {
+         // If user has access to all lines, return all childcare lines
+         if ($this->fldLineAccessAll)
+         {
+             return Line::query()
+                ->join('ww_mealtype', 'ww_line.fldMealType', '=', 'ww_mealtype.fldMealType')
+                ->where('ww_mealtype.fldIsChildcare', 1)
+                ->select('ww_line.*')
+                ->get();
+         }
+
+         $lines = $this->fldLineAccess;
+
+         // Return empty collection if no line access
+         if (empty($lines) || !is_array($lines))
+         {
+             return collect([]);
+         }
+
+         $operators = [];
+
+         // Build array of operators for query
+         foreach ($lines as $line)
+         {
+            $mealType = substr($line, 0, 1);
+            $lineNum = substr($line, 1);
+
+            $operators[] = function($query) use ($mealType, $lineNum)
+            {
+                $query->orWhere(function($q) use ($mealType, $lineNum)
+                {
+                    $q->where('ww_line.fldMealType', $mealType)
+                      ->where('ww_line.fldLineNum', $lineNum);
+                });
+            };
+         }
+
+         // Apply operators to query and return results
+         // Filter to only show childcare lines (fldIsChildcare = 1)
+         return Line::query()
+            ->join('ww_mealtype', 'ww_line.fldMealType', '=', 'ww_mealtype.fldMealType')
+            ->where('ww_mealtype.fldIsChildcare', 1)
+            ->where(function($query) use ($operators)
+            {
+                foreach($operators as $operator)
+                {
+                    $operator($query);
+                }
+            })
+            ->select('ww_line.*')
+            ->get();
+    }
+
+    /**
+     * Get POS lines the user has access to (excluding childcare lines)
+     */
+    public function posLines()
     {
         // Base query - exclude childcare lines
         $query = Line::query()
