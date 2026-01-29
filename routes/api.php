@@ -67,3 +67,13 @@ Route::get('/pos/lines/{mealType}/{lineNum}/students', [POSStudentController::cl
 Route::post('/pos/transactions', [POSTransactionController::class, 'store']);
 Route::post('/pos/payments', [POSPaymentController::class, 'store']);
 Route::post('/pos/deletions', [POSTransactionController::class, 'storeDeletions']);
+
+// Cross-Station Sync (Download from server)
+Route::get('/pos/students/{studentId}/transactions', [POSTransactionController::class, 'getStudentTransactions']);
+
+// Sync Validation
+Route::post('/pos/sync/validate', [POSTransactionController::class, 'validateSync']);
+
+// Reports
+Route::post('/pos/reports/{mealType}/{lineNum}/cash-till', [App\Http\Controllers\POSReportController::class, 'setCashTillAmount']);
+Route::get('/pos/reports/{mealType}/{lineNum}/{reportType}', [App\Http\Controllers\POSReportController::class, 'show']);

@@ -134,10 +134,17 @@ class POSController extends Controller
             ];
         });
 
+        // Get PosDevMode from system settings (key-value table)
+        $devModeValue = DB::table('ww_system')
+            ->where('fldParameter', 'PosDevMode')
+            ->value('fldValue');
+        $devMode = $devModeValue === 'true' || $devModeValue === '1';
+
         return response()->json([
             'success' => true,
             'token' => $session->fldToken,
             'isLineCloser' => (bool) $user->fldLineCloser,
+            'devMode' => (bool) $devMode,
             'user' => [
                 'id' => $user->fldUserId,
                 'username' => $user->fldUsername,

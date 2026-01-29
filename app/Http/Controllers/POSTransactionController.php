@@ -57,10 +57,14 @@ class POSTransactionController extends Controller
             'transactions.*.itemType' => 'nullable|string|max:1',  // M, C, A, etc.
         ]);
 
-        // Get user ID from session
+        // Get user ID from session (lookup user by username)
         $token = $request->bearerToken();
         $session = \App\Models\StationSession::findByToken($token);
-        $userId = $session ? $session->fldUserId : null;
+        $userId = null;
+        if ($session) {
+            $sessionUser = $session->user();
+            $userId = $sessionUser ? $sessionUser->fldUserId : null;
+        }
 
         $results = [];
         $hasCashError = false;
@@ -174,6 +178,7 @@ class POSTransactionController extends Controller
                 $txUserId = isset($tx['userId']) && is_numeric($tx['userId']) ? (int) $tx['userId'] : $userId;
 
                 // Insert transaction
+                // Note: fldStationSessionId requires schema update - omit for now
                 $serverId = DB::table('ww_pos_transactions')->insertGetId([
                     'fldUserId' => $txUserId,
                     'fldStudentId' => (int) $student->student_account_id,
@@ -192,6 +197,7 @@ class POSTransactionController extends Controller
                     'fldPosId' => $lineNum,
                     'fldSyncKey' => $tx['syncKey'],
                     'fldStationStudentId' => $stationStudentId,
+                    // 'fldStationSessionId' => $session->fldId,  // TODO: Add column to ww_pos_transactions
                     'fldCreatedDate' => Carbon::now('UTC'),
                     'fldFixed' => 1,
                 ]);
@@ -311,10 +317,14 @@ class POSTransactionController extends Controller
             'deletions.*.localId' => 'required|integer',
         ]);
 
-        // Get user ID from session
+        // Get user ID from session (lookup user by username)
         $token = $request->bearerToken();
         $session = \App\Models\StationSession::findByToken($token);
-        $userId = $session ? $session->fldUserId : null;
+        $userId = null;
+        if ($session) {
+            $sessionUser = $session->user();
+            $userId = $sessionUser ? $sessionUser->fldUserId : null;
+        }
 
         $results = [];
 
@@ -402,6 +412,354 @@ class POSTransactionController extends Controller
         } catch (\Exception $e) {
             DB::rollBack();
 
+            return response()->json([
+                'success' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * GET /pos/students/{studentId}/transactions
+     *
+     * Get transactions for a student (for cross-station sync).
+     * Returns transactions from ww_pos_transactions for the given student,
+     * filtered by lineDate and mealType.
+     *
+     * Used by frontend to lazy-merge transactions from other stations.
+     */
+    public function getStudentTransactions(Request $request, int $studentId): JsonResponse
+    {
+        try {
+            $token = $request->bearerToken();
+
+            if (!$token) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'No authorization token provided',
+                ], 401);
+            }
+
+            $session = \App\Models\StationSession::findByToken($token);
+
+            if (!$session) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Invalid or expired session',
+                ], 401);
+            }
+
+            // Update last activity
+            $session->updateLastActivity();
+
+            // Get filter parameters
+            $lineDate = $request->query('lineDate', Carbon::now()->format('Y-m-d'));
+            $mealType = $request->query('mealType', 'L');
+
+            // The studentId passed might be cloudId OR lcsId - we need cloudId for queries
+            // Try to find the student and get their cloudId
+            $student = DB::table('ww_student')
+                ->where('fldCloudId', $studentId)
+                ->orWhere('fldLcsId', $studentId)
+                ->first(['fldCloudId', 'fldLcsId']);
+
+            // Use cloudId for transaction queries (that's what's stored in fldStudentId)
+            $cloudId = $student ? (int) $student->fldCloudId : $studentId;
+
+            \Log::info("getStudentTransactions: input={$studentId}, resolved cloudId={$cloudId}, lineDate={$lineDate}, mealType={$mealType}");
+
+        // Get station session ID to identify "other" stations
+        // Note: Until fldStationSessionId is added to ww_pos_transactions/payments,
+        // we can't accurately determine which station made each transaction.
+        // For now, we use syncKey prefix matching as a workaround.
+        $currentStationSessionId = $session->fldId;
+        $currentStationId = $session->fldStationId;
+
+        // Build a lookup of session ID → station ID for labeling
+        // This maps historical sessions to their stations
+        $sessionToStation = DB::table('ww_pos_station_sessions')
+            ->pluck('fldStationId', 'fldId')
+            ->toArray();
+
+        // Build syncKey prefix for this station session
+        // syncKey format: {lineLogId}-{stationSessionId}-{localId}
+        // We match by the middle segment to identify our transactions
+        $syncKeyPattern = "%-{$currentStationSessionId}-%";
+
+        // Fetch transactions for this student (using cloudId)
+        // Note: fldStationSessionId column doesn't exist yet, so we can't join to station tables
+        $transactions = DB::table('ww_pos_transactions as t')
+            ->leftJoin('ww_menuitem as m', 'm.fldItemId', '=', 't.fldItemId')
+            ->where('t.fldStudentId', $cloudId)
+            ->where('t.fldLineDate', $lineDate)
+            ->where('t.fldLineType', $mealType)
+            ->select([
+                't.fldId as serverId',
+                't.fldSyncKey as syncKey',
+                't.fldStudentId as studentId',
+                't.fldItemId as itemId',
+                'm.fldDescription as itemName',  // ww_menuitem uses fldDescription, not fldName
+                't.fldMealType as itemType',
+                't.fldPrice as price',
+                't.fldTransactionTimestampUTC as timestampUTC',
+                't.fldCreatedDate as createdAt',
+                't.fldLineNum as lineNum',
+            ])
+            ->orderBy('t.fldCreatedDate', 'asc')
+            ->get();
+
+        // Mark each transaction as local or remote based on syncKey pattern
+        $formatted = $transactions->map(function ($tx) use ($currentStationSessionId, $currentStationId, $sessionToStation) {
+            // Parse syncKey to check if it's from this station
+            // Format: {lineLogId}-{stationSessionId}-{localId}
+            $isOtherStation = true;  // Assume other station by default
+            $txSessionId = null;
+            $txStationId = null;
+            if ($tx->syncKey) {
+                $parts = explode('-', $tx->syncKey);
+                if (count($parts) >= 2) {
+                    $txSessionId = (int) $parts[1];
+                    // Look up which station this session belongs to
+                    $txStationId = $sessionToStation[$txSessionId] ?? null;
+                    // It's our station if the station ID matches (not session ID)
+                    if ($txStationId === $currentStationId) {
+                        $isOtherStation = false;
+                    }
+                }
+            }
+
+            return [
+                'serverId' => $tx->serverId,
+                'syncKey' => $tx->syncKey,
+                'studentId' => $tx->studentId,
+                'itemId' => $tx->itemId,
+                'itemName' => $tx->itemName ?? "Item {$tx->itemId}",
+                'itemType' => $tx->itemType,
+                'price' => (float) $tx->price,
+                'timestampUTC' => $tx->timestampUTC,
+                'createdAt' => $tx->createdAt,
+                'stationSessionId' => $txSessionId,
+                'stationName' => $isOtherStation ? "St{$txStationId}" : 'This Station',
+                'stationId' => $txStationId,
+                'isOtherStation' => $isOtherStation,
+            ];
+        });
+
+        // Also get payments (using cloudId)
+        // Note: ww_pos_payments doesn't have fldLineType, use fldMealType instead
+        $payments = DB::table('ww_pos_payments as p')
+            ->where('p.fldStudentId', $cloudId)
+            ->where('p.fldLineDate', $lineDate)
+            ->where('p.fldMealType', $mealType)
+            ->select([
+                'p.fldId as serverId',
+                'p.fldSyncKey as syncKey',
+                'p.fldStudentId as studentId',
+                'p.fldMealType as paymentType',  // Use mealType as fallback
+                'p.fldAmount as amount',
+                'p.fldMemo as memo',
+                'p.fldCreatedDate as createdAt',
+            ])
+            ->orderBy('p.fldCreatedDate', 'asc')
+            ->get();
+
+        $formattedPayments = $payments->map(function ($p) use ($currentStationSessionId, $currentStationId, $sessionToStation) {
+            // Parse syncKey to check if it's from this station
+            $isOtherStation = true;
+            $pmtSessionId = null;
+            $pmtStationId = null;
+            if ($p->syncKey) {
+                $parts = explode('-', $p->syncKey);
+                if (count($parts) >= 2) {
+                    $pmtSessionId = (int) $parts[1];
+                    // Look up which station this session belongs to
+                    $pmtStationId = $sessionToStation[$pmtSessionId] ?? null;
+                    // It's our station if the station ID matches (not session ID)
+                    if ($pmtStationId === $currentStationId) {
+                        $isOtherStation = false;
+                    }
+                }
+            }
+
+            // Parse payment type from memo (format: "L4 CASH" or "B2 CHK 1234")
+            $paymentType = 'CASH';
+            if ($p->memo && stripos($p->memo, 'CHK') !== false) {
+                $paymentType = 'CHECK';
+            }
+
+            return [
+                'serverId' => $p->serverId,
+                'syncKey' => $p->syncKey,
+                'studentId' => $p->studentId,
+                'paymentType' => $paymentType,
+                'amount' => (float) $p->amount,
+                'memo' => $p->memo,
+                'createdAt' => $p->createdAt,
+                'stationSessionId' => $pmtSessionId,
+                'stationName' => $isOtherStation ? "St{$pmtStationId}" : 'This Station',
+                'stationId' => $pmtStationId,
+                'isOtherStation' => $isOtherStation,
+                'isPayment' => true,
+            ];
+        });
+
+        return response()->json([
+            'success' => true,
+            'transactions' => $formatted,
+            'payments' => $formattedPayments,
+            'currentStationSessionId' => $currentStationSessionId,
+        ]);
+
+        } catch (\Exception $e) {
+            \Log::error('getStudentTransactions error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * POST /pos/sync/validate
+     *
+     * Validate sync state - two-step approach:
+     * 1. Quick count check (mode=count) - just compare totals
+     * 2. Full compare (mode=full) - compare syncKeys if counts differ
+     */
+    public function validateSync(Request $request): JsonResponse
+    {
+        try {
+            $token = $request->bearerToken();
+
+            if (!$token) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'No authorization token provided',
+                ], 401);
+            }
+
+            $session = \App\Models\StationSession::findByToken($token);
+
+            if (!$session) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Invalid or expired session',
+                ], 401);
+            }
+
+            $request->validate([
+                'studentId' => 'required|integer',
+                'lineDate' => 'required|date_format:Y-m-d',
+                'mealType' => 'required|string|size:1',
+                'mode' => 'string|in:count,full',  // count = quick check, full = compare syncKeys
+                'transactionCount' => 'integer',   // For count mode
+                'paymentCount' => 'integer',       // For count mode
+                'transactionSyncKeys' => 'array',  // For full mode
+                'paymentSyncKeys' => 'array',      // For full mode
+            ]);
+
+            $studentId = $request->studentId;
+            $lineDate = $request->lineDate;
+            $mealType = $request->mealType;
+            $mode = $request->mode ?? 'count';
+
+            // Resolve cloudId (studentId might be cloudId or lcsId)
+            $student = DB::table('ww_student')
+                ->where('fldCloudId', $studentId)
+                ->orWhere('fldLcsId', $studentId)
+                ->first(['fldCloudId']);
+            $cloudId = $student ? (int) $student->fldCloudId : $studentId;
+
+            // Get server counts (using cloudId)
+            $serverTxCount = DB::table('ww_pos_transactions')
+                ->where('fldStudentId', $cloudId)
+                ->where('fldLineDate', $lineDate)
+                ->where('fldLineType', $mealType)
+                ->count();
+
+            $serverPmtCount = DB::table('ww_pos_payments')
+                ->where('fldStudentId', $cloudId)
+                ->where('fldLineDate', $lineDate)
+                ->where('fldMealType', $mealType)
+                ->count();
+
+            // COUNT MODE - quick check
+            // Since "in sync" means "all local made it to server", we can only confirm
+            // sync if client has no transactions (nothing to validate).
+            // Otherwise, need full mode to verify local transactions are on server.
+            if ($mode === 'count') {
+                $clientTxCount = $request->transactionCount ?? 0;
+                $clientPmtCount = $request->paymentCount ?? 0;
+
+                // Only "in sync" via count mode if client has nothing to validate
+                $isInSync = ($clientTxCount === 0) && ($clientPmtCount === 0);
+
+                return response()->json([
+                    'success' => true,
+                    'mode' => 'count',
+                    'isInSync' => $isInSync,
+                    'transactions' => [
+                        'clientCount' => $clientTxCount,
+                        'serverCount' => $serverTxCount,
+                    ],
+                    'payments' => [
+                        'clientCount' => $clientPmtCount,
+                        'serverCount' => $serverPmtCount,
+                    ],
+                ]);
+            }
+
+            // FULL MODE - compare syncKeys
+            $clientTxKeys = $request->transactionSyncKeys ?? [];
+            $clientPmtKeys = $request->paymentSyncKeys ?? [];
+
+            // Get server syncKeys (using cloudId)
+            $serverTxKeys = DB::table('ww_pos_transactions')
+                ->where('fldStudentId', $cloudId)
+                ->where('fldLineDate', $lineDate)
+                ->where('fldLineType', $mealType)
+                ->whereNotNull('fldSyncKey')
+                ->pluck('fldSyncKey')
+                ->toArray();
+
+            $serverPmtKeys = DB::table('ww_pos_payments')
+                ->where('fldStudentId', $cloudId)
+                ->where('fldLineDate', $lineDate)
+                ->where('fldMealType', $mealType)
+                ->whereNotNull('fldSyncKey')
+                ->pluck('fldSyncKey')
+                ->toArray();
+
+            // Find discrepancies
+            $txMissingFromServer = array_values(array_diff($clientTxKeys, $serverTxKeys));
+            $pmtMissingFromServer = array_values(array_diff($clientPmtKeys, $serverPmtKeys));
+            $txMissingFromClient = array_values(array_diff($serverTxKeys, $clientTxKeys));
+            $pmtMissingFromClient = array_values(array_diff($serverPmtKeys, $clientPmtKeys));
+
+            // "In Sync" = all LOCAL transactions made it to server
+            // We don't care about "missing from client" (those are other stations' transactions)
+            $isInSync = empty($txMissingFromServer) && empty($pmtMissingFromServer);
+
+            return response()->json([
+                'success' => true,
+                'mode' => 'full',
+                'isInSync' => $isInSync,
+                'transactions' => [
+                    'clientCount' => count($clientTxKeys),
+                    'serverCount' => count($serverTxKeys),
+                    'missingFromServer' => $txMissingFromServer,
+                    'missingFromClient' => $txMissingFromClient,
+                ],
+                'payments' => [
+                    'clientCount' => count($clientPmtKeys),
+                    'serverCount' => count($serverPmtKeys),
+                    'missingFromServer' => $pmtMissingFromServer,
+                    'missingFromClient' => $pmtMissingFromClient,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            \Log::error('validateSync error: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'error' => $e->getMessage(),

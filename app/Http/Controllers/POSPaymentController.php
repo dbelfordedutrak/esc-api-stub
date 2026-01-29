@@ -42,14 +42,19 @@ class POSPaymentController extends Controller
             'payments.*.stationSessionId' => 'required|integer',
             'payments.*.mealType' => 'nullable|string|size:1',
             'payments.*.lineNum' => 'nullable|integer',
-            'payments.*.checkNumber' => 'nullable|string',  // For check payments
+            'payments.*.checkNumber' => 'nullable|string',  // For check payments (legacy)
+            'payments.*.memo' => 'nullable|string',  // Check description/comment
             'payments.*.changeGiven' => 'nullable|numeric',
         ]);
 
-        // Get user ID from session
+        // Get user ID from session (lookup user by username)
         $token = $request->bearerToken();
         $session = \App\Models\StationSession::findByToken($token);
-        $userId = $session ? $session->fldUserId : null;
+        $userId = null;
+        if ($session) {
+            $sessionUser = $session->user();
+            $userId = $sessionUser ? $sessionUser->fldUserId : null;
+        }
 
         $results = [];
         $hasCashError = false;
@@ -145,18 +150,19 @@ class POSPaymentController extends Controller
                 $paymentType = strtoupper($pmt['paymentType']);
                 $isCheck = ($paymentType === 'CHECK' || $paymentType === 'CHK') ? 1 : 0;
 
-                // Build memo in legacy format: "LL CASH" or "BL CHK 1234" (max 18 chars)
-                // First char = meal type (L/B/D), second char = line num (last digit)
-                $lineDigit = $lineNum % 10;
-                $prefix = $mealType . $lineDigit . ' ';
+                // Build memo:
+                // - For checks: "CHK {memo}" (no line prefix, max 18 chars)
+                // - For cash: "LL CASH" where L=meal type, L=line digit
                 if ($isCheck) {
-                    $checkNum = $pmt['checkNumber'] ?? '';
-                    $memo = $prefix . 'CHK ' . substr($checkNum, 0, 18 - strlen($prefix) - 4);
+                    $checkMemo = $pmt['memo'] ?? $pmt['checkNumber'] ?? '';
+                    $memo = 'CHK ' . substr($checkMemo, 0, 14); // 18 - 4 for "CHK "
                 } else {
-                    $memo = $prefix . 'CASH';
+                    $lineDigit = $lineNum % 10;
+                    $memo = $mealType . $lineDigit . ' CASH';
                 }
 
                 // Insert payment
+                // Note: fldLineType, fldStationSessionId require schema update - omit for now
                 $serverId = DB::table('ww_pos_payments')->insertGetId([
                     'fldUserId' => $pmt['userId'] ?? $userId,
                     'fldStudentId' => (int) $student->student_account_id,
@@ -165,6 +171,7 @@ class POSPaymentController extends Controller
                     'fldMealType' => $mealType,
                     'fldLineNum' => $lineNum,
                     'fldLineDate' => $pmt['lineDate'],
+                    // 'fldLineType' => $mealType,  // TODO: Add column to ww_pos_payments
                     'fldAmount' => $pmt['amount'],
                     'fldChangeGiven' => $pmt['changeGiven'] ?? 0,
                     'fldMemo' => $memo,
@@ -172,6 +179,7 @@ class POSPaymentController extends Controller
                     'fldPosId' => $lineNum,
                     'fldSyncKey' => $pmt['syncKey'],
                     'fldStationStudentId' => $stationStudentId,
+                    // 'fldStationSessionId' => $session ? $session->fldId : null,  // TODO: Add column
                     'fldCreatedDate' => Carbon::now('UTC'),
                     'fldFixed' => 1,
                 ]);
